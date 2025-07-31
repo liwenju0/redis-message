@@ -26,7 +26,7 @@ from typing import Optional, Dict, List, Callable, Any
 from abc import ABC, abstractmethod
 
 import redis
-logger = logging.getLogger(__name__)
+
 
 class RedisMessage:
     """
@@ -64,10 +64,10 @@ class RedisMessage:
         try:
             self._redis_client.xack(self._stream_name, self._group_name, self._message_id)
             self._acked = True
-            logger.debug(f"Message {self._message_id} acked successfully")
+            logging.debug(f"Message {self._message_id} acked successfully")
             return True
         except Exception as e:
-            logger.error(f"Failed to ack message {self._message_id}: {str(e)}")
+            logging.error(f"Failed to ack message {self._message_id}: {str(e)}")
             return False
 
 
@@ -99,7 +99,7 @@ class MessageHandler(ABC):
             message: 处理失败的消息
             error: 异常信息
         """
-        logger.error(f"Failed to handle message {message.get_message_id()}: {str(error)}")
+        logging.error(f"Failed to handle message {message.get_message_id()}: {str(error)}")
 
 
 class RedisStreamProducer:
@@ -130,12 +130,12 @@ class RedisStreamProducer:
         for attempt in range(max_retries):
             try:
                 message_id = self.redis_client.xadd(stream_name, message_data)
-                logger.info(f"Message sent to {stream_name}: {message_id}")
+                logging.info(f"Message sent to {stream_name}: {message_id}")
                 return message_id
             except Exception as e:
-                logger.warning(f"Send message attempt {attempt + 1} failed: {str(e)}")
+                logging.warning(f"Send message attempt {attempt + 1} failed: {str(e)}")
                 if attempt == max_retries - 1:
-                    logger.error(f"Failed to send message after {max_retries} attempts")
+                    logging.error(f"Failed to send message after {max_retries} attempts")
                     return None
                 time.sleep(0.1 * (2 ** attempt))  # 指数退避
         
@@ -164,7 +164,7 @@ class RedisStreamConsumer:
             handler: 消息处理器实例
         """
         self._handlers[stream_name] = handler
-        logger.info(f"Handler registered for stream: {stream_name}")
+        logging.info(f"Handler registered for stream: {stream_name}")
     
     def _ensure_consumer_group(self, stream_name: str, group_name: str):
         """
@@ -182,13 +182,13 @@ class RedisStreamConsumer:
             if not group_exists:
                 # 创建消费者组，从 Stream 开始位置消费
                 self.redis_client.xgroup_create(stream_name, group_name, id='0', mkstream=True)
-                logger.info(f"Consumer group '{group_name}' created for stream '{stream_name}'")
+                logging.info(f"Consumer group '{group_name}' created for stream '{stream_name}'")
                 
         except redis.exceptions.ResponseError as e:
             if "no such key" in str(e).lower():
                 # Stream 不存在，创建消费者组时会自动创建 Stream
                 self.redis_client.xgroup_create(stream_name, group_name, id='0', mkstream=True)
-                logger.info(f"Stream '{stream_name}' and group '{group_name}' created")
+                logging.info(f"Stream '{stream_name}' and group '{group_name}' created")
             else:
                 raise
     
@@ -227,45 +227,7 @@ class RedisStreamConsumer:
             return messages
             
         except Exception as e:
-            logger.error(f"Failed to read messages from {stream_name}: {str(e)}")
-            return []
-    
-    def _process_pending_messages(self, stream_name: str, group_name: str) -> List[RedisMessage]:
-        """
-        处理未确认的消息（故障恢复）
-        
-        Args:
-            stream_name: Stream 名称
-            group_name: 消费者组名称
-            
-        Returns:
-            List[RedisMessage]: 未确认的消息列表
-        """
-        try:
-            # 获取当前消费者的待处理消息
-            pending = self.redis_client.xpending_range(
-                stream_name, group_name, '-', '+', 10, self.consumer_name
-            )
-            
-            messages = []
-            for msg_info in pending:
-                msg_id = msg_info['message_id']
-                # 重新读取消息内容
-                msg_data = self.redis_client.xrange(stream_name, msg_id, msg_id)
-                if msg_data:
-                    _, fields = msg_data[0]
-                    message = RedisMessage(
-                        self.redis_client, stream_name, group_name, msg_id, fields
-                    )
-                    messages.append(message)
-            
-            if messages:
-                logger.info(f"Found {len(messages)} pending messages for recovery")
-            
-            return messages
-            
-        except Exception as e:
-            logger.error(f"Failed to process pending messages: {str(e)}")
+            logging.error(f"Failed to read messages from {stream_name}: {str(e)}")
             return []
     
     async def consume(self, stream_name: str, group_name: str, 
@@ -287,13 +249,11 @@ class RedisStreamConsumer:
         # 确保消费者组存在
         self._ensure_consumer_group(stream_name, group_name)
         
-        logger.info(f"Consumer {self.consumer_name} started for stream {stream_name}")
+        logging.info(f"Consumer {self.consumer_name} started for stream {stream_name}")
         
-        # 故障恢复：优先处理未确认的消息
+        # 故障恢复：优先处理所有未确认的消息
         if recovery_mode:
-            pending_messages = self._process_pending_messages(stream_name, group_name)
-            for message in pending_messages:
-                await self._handle_message(message, handler)
+            await self._recover_pending_messages(stream_name, group_name, handler)
         
         # 主消费循环
         while self.running:
@@ -304,13 +264,89 @@ class RedisStreamConsumer:
                     await self._handle_message(message, handler)
                     
             except KeyboardInterrupt:
-                logger.info("Consumer interrupted by user")
+                logging.info("Consumer interrupted by user")
                 break
             except Exception as e:
-                logger.error(f"Consumer error: {str(e)}")
-                time.sleep(1)  # 避免错误循环
+                logging.error(f"Consumer error: {str(e)}")
+                await asyncio.sleep(1)
         
-        logger.info(f"Consumer {self.consumer_name} stopped")
+        logging.info(f"Consumer {self.consumer_name} stopped")
+
+    async def _recover_pending_messages(self, stream_name: str, group_name: str, handler: MessageHandler):
+        """
+        恢复所有未确认的消息
+        
+        Args:
+            stream_name: Stream 名称
+            group_name: 消费者组名称
+            handler: 消息处理器
+        """
+        logging.info(f"Starting recovery of pending messages for consumer {self.consumer_name}")
+        
+        total_recovered = 0
+        batch_size = 10  # 每批处理10条消息
+        
+        while True:
+            # 获取一批未确认消息
+            pending_messages = self._process_pending_messages(stream_name, group_name, batch_size)
+            
+            if not pending_messages:
+                break  # 没有更多未确认消息
+            
+            # 处理这批消息
+            for message in pending_messages:
+                await self._handle_message(message, handler)
+                total_recovered += 1
+            
+            logging.info(f"Recovered batch of {len(pending_messages)} messages, total: {total_recovered}")
+            
+            # 如果这批消息数量少于批次大小，说明已经处理完所有消息
+            if len(pending_messages) < batch_size:
+                break
+        
+        if total_recovered > 0:
+            logging.info(f"Recovery completed: {total_recovered} messages recovered")
+        else:
+            logging.info("No pending messages to recover")
+
+    def _process_pending_messages(self, stream_name: str, group_name: str, batch_size: int = 10) -> List[RedisMessage]:
+        """
+        处理未确认的消息（故障恢复）
+        
+        Args:
+            stream_name: Stream 名称
+            group_name: 消费者组名称
+            batch_size: 批次大小
+            
+        Returns:
+            List[RedisMessage]: 未确认的消息列表
+        """
+        try:
+            # 获取当前消费者的待处理消息
+            pending = self.redis_client.xpending_range(
+                stream_name, group_name, '-', '+', batch_size, self.consumer_name
+            )
+            
+            messages = []
+            for msg_info in pending:
+                msg_id = msg_info['message_id']
+                # 重新读取消息内容
+                msg_data = self.redis_client.xrange(stream_name, msg_id, msg_id)
+                if msg_data:
+                    _, fields = msg_data[0]
+                    message = RedisMessage(
+                        self.redis_client, stream_name, group_name, msg_id, fields
+                    )
+                    messages.append(message)
+            
+            if messages:
+                logging.debug(f"Found {len(messages)} pending messages for recovery")
+            
+            return messages
+            
+        except Exception as e:
+            logging.error(f"Failed to process pending messages: {str(e)}")
+            return []
     
     async def _handle_message(self, message: RedisMessage, handler: MessageHandler):
         """
@@ -327,15 +363,15 @@ class RedisStreamConsumer:
             if success:
                 # 处理成功，确认消息
                 message.ack()
-                logger.debug(f"Message {message.get_message_id()} processed successfully")
+                logging.debug(f"Message {message.get_message_id()} processed successfully")
             else:
                 # 处理失败，不确认消息（会重新投递）
-                logger.warning(f"Message {message.get_message_id()} processing failed")
+                logging.warning(f"Message {message.get_message_id()} processing failed")
                 
         except Exception as e:
             # 异常处理
             handler.on_error(message, e)
-            logger.error(f"Exception handling message {message.get_message_id()}: {str(e)}")
+            logging.error(f"Exception handling message {message.get_message_id()}: {str(e)}")
     
     def stop(self):
         """停止消费者"""
@@ -371,7 +407,7 @@ class StreamMonitor:
                 'last_entry': info.get('last-entry')
             }
         except Exception as e:
-            logger.error(f"Failed to get stream info for {stream_name}: {str(e)}")
+            logging.error(f"Failed to get stream info for {stream_name}: {str(e)}")
             return {}
     
     def get_consumer_group_info(self, stream_name: str, group_name: str) -> Dict[str, Any]:
@@ -398,7 +434,7 @@ class StreamMonitor:
                     }
             return {}
         except Exception as e:
-            logger.error(f"Failed to get group info for {stream_name}:{group_name}: {str(e)}")
+            logging.error(f"Failed to get group info for {stream_name}:{group_name}: {str(e)}")
             return {}
     
     def get_pending_messages(self, stream_name: str, group_name: str) -> List[Dict[str, Any]]:
@@ -424,7 +460,7 @@ class StreamMonitor:
                 for msg in pending
             ]
         except Exception as e:
-            logger.error(f"Failed to get pending messages: {str(e)}")
+            logging.error(f"Failed to get pending messages: {str(e)}")
             return []
 
 
@@ -473,7 +509,7 @@ class RedisMessageFramework:
         """关闭框架，停止所有消费者"""
         for consumer in self._consumers:
             consumer.stop()
-        logger.info("Redis Message Framework shutdown completed")
+        logging.info("Redis Message Framework shutdown completed")
 
 
 # 使用示例
@@ -487,7 +523,7 @@ if __name__ == "__main__":
             task_id = payload.get('task_id')
             task_type = payload.get('task_type')
             
-            logger.info(f"Processing task {task_id} of type {task_type}")
+            logging.info(f"Processing task {task_id} of type {task_type}")
             
             # 模拟任务处理
             await asyncio.sleep(1)
